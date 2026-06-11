@@ -21,5 +21,5 @@ Key Findings
 Repository Structure
  `Predictive Stroke Analysis Data 2 (1).R`: The combined, fully commented R script containing all data manipulation, modeling, and evaluation code.
  `stroke_analysis.Rmd`: The RMarkdown file used to generate the final HTML report.
- `stroke_analysis.html`: The compiled interactive report (viewable via the link at the top).
+ `index.html`: The compiled interactive report (viewable via the link at the top).
  `visualizations`: Folder containing high-resolution `.png` exports of the PR-Curves, Variable Importance, and EDA plots.
