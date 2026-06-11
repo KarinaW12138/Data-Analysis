@@ -1,4 +1,4 @@
-=Stroke Risk Prediction Under Severe Class Imbalance
+Stroke Risk Prediction Under Severe Class Imbalance
 
 
 
