@@ -1,0 +1,423 @@
+---
+title: "Stroke Risk Prediction: Logistic Regression vs. Random Forest Under Class Imbalance"
+author: "Yuwen Wang"
+date: "June 9, 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 7
+    fig_height: 4.5
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+---
+
+1. Project Overview
+
+This project evaluates classification models on a highly imbalanced clinical dataset (n=5,110, minority class ≈ 5%). The objective is to benchmark an interpretable baseline (Logistic Regression) against an ensemble learning approach (Random Forest) in predicting stroke risk. Given the severe class imbalance, model performance is primarily evaluated using Precision-Recall Area Under the Curve (PR-AUC) rather than standard accuracy, alongside an analysis of optimal decision thresholds for clinical screening applications.
+
+
+Key questions:
+
+1. Which clinical and demographic features are most predictive of stroke?
+2. How does a flexible ensemble model (Random Forest) compare to an interpretable baseline (Logistic Regression) when the outcome is rare?
+3. How does the decision threshold affect the precision-recall tradeoff, and what threshold is most appropriate in a clinical screening context?
+
+---
+
+2. Setup and Data Loading
+
+```{r libraries}
+library(ggplot2)
+library(dplyr)
+library(randomForest)
+library(pROC)
+library(PRROC)
+library(caret)
+```
+
+```{r load-data}
+clean_data <- read.csv("~/Downloads/stroke.csv", stringsAsFactors = FALSE)
+clean_data <- clean_data %>% rename_with(tolower)
+
+# Confirm dimensions
+cat("Dataset dimensions:", dim(clean_data)[1], "rows,", dim(clean_data)[2], "columns\n")
+```
+
+---
+
+3. Data Cleaning and Preprocessing
+
+3.1 BMI Imputation
+
+BMI is stored as a character column with `"N/A"` strings. We convert it to numeric (which automatically introduces `NA` values) and impute missing entries with the column median — a robust choice given that BMI distributions tend to be right-skewed.
+
+```{r bmi-imputation}
+clean_data$bmi <- as.numeric(clean_data$bmi)
+
+median_bmi <- median(clean_data$bmi, na.rm = TRUE)
+cat("Median BMI used for imputation:", median_bmi, "\n")
+cat("Missing BMI values imputed:", sum(is.na(clean_data$bmi)), "\n")
+
+clean_data$bmi[is.na(clean_data$bmi)] <- median_bmi
+```
+
+3.2 Factor Encoding
+
+All categorical variables are converted to R factors so that modeling functions treat them correctly as nominal predictors rather than numeric values.
+
+```{r factor-encoding}
+clean_data <- clean_data %>%
+  mutate(
+    stroke         = as.factor(stroke),        
+    hypertension   = as.factor(hypertension),  
+    heart_disease  = as.factor(heart_disease), 
+    gender         = as.factor(gender),
+    ever_married   = as.factor(ever_married),
+    work_type      = as.factor(work_type),
+    residence_type = as.factor(residence_type),
+    smoking_status = as.factor(smoking_status)
+  )
+
+cat("Class distribution of stroke outcome:\n")
+table(clean_data$stroke)
+```
+
+---
+
+4. Exploratory Data Analysis
+
+---
+
+4.1 Class Imbalance
+
+fig.cap="Target variable distribution highlighting a ~1:20 minority-to-majority class ratio."
+
+```{r plot-imbalance, fig.cap="The dataset contains roughly 20:1 No Stroke to Stroke cases, making accuracy a misleading performance metric."}
+plot1 <- ggplot(clean_data, aes(x = stroke, fill = stroke)) +
+  geom_bar(color = "black", width = 0.5) +
+  scale_fill_manual(
+    values = c("0" = "#D3D3D3", "1" = "#C0392B"),
+    labels = c("0" = "No Stroke", "1" = "Stroke")
+  ) +
+  scale_x_discrete(labels = c("0" = "No Stroke", "1" = "Stroke")) +
+  coord_cartesian(ylim = c(0, 5400)) +
+  labs(
+    title = "Target Variable Distribution: Class Imbalance",
+    x     = "Patient Stroke Outcome",
+    y     = "Number of Patient Records"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5, size = 16),
+    panel.grid.major.x = element_blank(),
+    legend.position    = "none"
+  ) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.5, fontface = "bold")
+
+print(plot1)
+ggsave("chart1_class_imbalance.png", plot = plot1, width = 6, height = 4.5, dpi = 300)
+```
+```
+
+---
+
+4.3 Stroke Rate by Hypertension Status
+
+Patients with hypertension have a meaningfully higher proportion of strokes. This suggests hypertension will be an informative predictor in both models.
+
+```r
+```{r plot-hypertension, fig.cap="Hypertensive patients show a higher stroke rate, though the overall proportion remains small due to the class imbalance."}
+plot3 <- ggplot(clean_data, aes(x = hypertension, fill = stroke)) +
+  geom_bar(position = "fill", color = "black", width = 0.5) +
+  scale_fill_manual(
+    values = c("0" = "#D3D3D3", "1" = "#C0392B"),
+    labels = c("No Stroke", "Stroke")
+  ) +
+  scale_x_discrete(labels = c("0" = "Normal Blood Pressure", "1" = "Hypertension")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Stroke Proportions by Hypertension Status",
+    x     = "Pre-existing Medical Condition",
+    y     = "Percentage of Patient Group",
+    fill  = "Outcome"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title         = element_text(face = "bold", hjust = 0.5, size = 16),
+    panel.grid.major.x = element_blank(),
+    legend.position    = "right"
+  )
+
+print(plot3)
+ggsave("chart3_hypertension_percentages.png", plot = plot3, width = 6.5, height = 4.5, dpi = 300)
+```
+
+---
+
+5. Modeling
+
+5.1 Train-Test Split
+
+A stratified 70/30 split is used to ensure both the training and test sets preserve the original stroke-to-no-stroke ratio. Standard random splitting risks assigning very few or zero stroke cases to one partition given the imbalance.
+
+```{r train-test-split}
+clean_data$stroke <- factor(clean_data$stroke, levels = c("0", "1"))
+set.seed(123)
+
+stroke0 <- clean_data[clean_data$stroke == "0", ]
+stroke1 <- clean_data[clean_data$stroke == "1", ]
+
+train0 <- sample(1:nrow(stroke0), 0.70 * nrow(stroke0))
+train1 <- sample(1:nrow(stroke1), 0.70 * nrow(stroke1))
+
+train_data <- rbind(stroke0[train0, ], stroke1[train1, ])
+test_data  <- rbind(stroke0[-train0, ], stroke1[-train1, ])
+
+cat("Training set stroke distribution:\n"); print(table(train_data$stroke))
+cat("\nTest set stroke distribution:\n");    print(table(test_data$stroke))
+```
+
+5.2 Logistic Regression
+
+Logistic regression serves as the interpretable baseline. It models the log-odds of stroke as a linear function of all available predictors, making coefficient signs directly meaningful.
+
+```{r logistic-regression}
+log_model <- glm(
+  stroke ~ age + hypertension + heart_disease + avg_glucose_level + bmi +
+    gender + ever_married + work_type + residence_type + smoking_status,
+  data   = train_data,
+  family = binomial
+)
+
+summary(log_model)
+```
+
+```{r logistic-predictions}
+log_prob <- predict(log_model, newdata = test_data, type = "response")
+
+# Threshold = 0.50 (standard baseline)
+log_pred <- as.factor(ifelse(log_prob > 0.50, "1", "0"))
+
+cat("Confusion Matrix (Logistic Regression, threshold = 0.50):\n")
+print(table(Predicted = log_pred, Actual = test_data$stroke))
+
+log_acc <- mean(log_pred == test_data$stroke)
+log_roc <- roc(test_data$stroke, log_prob)
+log_auc <- auc(log_roc)
+
+cat("\nAccuracy:", round(log_acc, 4))
+cat("\nAUC-ROC: ", round(log_auc, 4), "\n")
+```
+
+5.3 Random Forest
+
+Random Forest builds 500 decision trees and averages their predictions. It captures non-linear interactions between predictors that logistic regression cannot model — relevant here because stroke risk likely involves interactions between age, glucose level, and hypertension.
+
+```{r random-forest}
+set.seed(123)
+
+rf_model <- randomForest(
+  stroke ~ age + hypertension + heart_disease + avg_glucose_level + bmi +
+    gender + ever_married + work_type + residence_type + smoking_status,
+  data       = train_data,
+  ntree      = 500,
+  importance = TRUE
+)
+
+print(rf_model)
+```
+
+```{r rf-predictions}
+rf_prob <- predict(rf_model, newdata = test_data, type = "prob")[, "1"]
+
+# Threshold = 0.50
+rf_pred <- as.factor(ifelse(rf_prob > 0.50, "1", "0"))
+
+cat("Confusion Matrix (Random Forest, threshold = 0.50):\n")
+print(table(Predicted = rf_pred, Actual = test_data$stroke))
+
+rf_acc <- mean(rf_pred == test_data$stroke)
+rf_roc <- roc(test_data$stroke, rf_prob)
+rf_auc <- auc(rf_roc)
+
+cat("\nAccuracy:", round(rf_acc, 4))
+cat("\nAUC-ROC: ", round(rf_auc, 4), "\n")
+```
+
+---
+
+6. Model Evaluation
+
+6.1 Full Metrics Comparison
+
+Because the outcome is rare (~5%), accuracy is dominated by the majority class. AUC-ROC measures rank-ordering ability across all thresholds. PR-AUC focuses specifically on performance among positive cases and is the most informative metric when prevalence is low.
+
+```{r evaluation-table}
+actual <- as.numeric(as.character(test_data$stroke))
+
+calc_metrics <- function(pred, actual_vec) {
+  pred_factor   <- factor(pred, levels = c("0", "1"))
+  actual_factor <- factor(as.character(actual_vec), levels = c("0", "1"))
+  cm <- confusionMatrix(pred_factor, actual_factor, positive = "1", mode = "prec_recall")
+  c(Precision = cm$byClass["Precision"],
+    Recall    = cm$byClass["Recall"],
+    F1        = cm$byClass["F1"])
+}
+
+log_m <- calc_metrics(log_pred, actual)
+rf_m  <- calc_metrics(rf_pred,  actual)
+
+pr_log <- pr.curve(
+  scores.class0 = log_prob[actual == 1],
+  scores.class1 = log_prob[actual == 0],
+  curve = TRUE
+)
+pr_rf <- pr.curve(
+  scores.class0 = rf_prob[actual == 1],
+  scores.class1 = rf_prob[actual == 0],
+  curve = TRUE
+)
+
+metrics_table <- data.frame(
+  Model       = c("Logistic Regression", "Random Forest"),
+  Accuracy    = round(c(log_acc, rf_acc), 4),
+  AUC_ROC     = round(c(as.numeric(log_auc), as.numeric(rf_auc)), 4),
+  PR_AUC      = round(c(pr_log$auc.integral, pr_rf$auc.integral), 4),
+  Precision   = round(c(log_m["Precision"], rf_m["Precision"]), 4),
+  Recall      = round(c(log_m["Recall"],    rf_m["Recall"]), 4),
+  F1          = round(c(log_m["F1"],        rf_m["F1"]), 4)
+)
+
+knitr::kable(metrics_table, caption = "Model Performance Comparison (threshold = 0.50)")
+```
+
+6.2 Precision-Recall Curves
+
+```{r pr-curves, fig.cap="PR curves reveal Random Forest's advantage when identifying true positive stroke cases — the metric that matters most in a screening context."}
+plot(pr_log, main = "Precision-Recall Curves", col = "#2C3E50", lwd = 2.5)
+plot(pr_rf,  add = TRUE, col = "#C0392B", lwd = 2.5)
+legend(
+  "topright",
+  legend = c(
+    paste0("Logistic Regression (PR-AUC = ", round(pr_log$auc.integral, 3), ")"),
+    paste0("Random Forest (PR-AUC = ",        round(pr_rf$auc.integral,  3), ")")
+  ),
+  col = c("#2C3E50", "#C0392B"),
+  lwd = 2
+)
+```
+
+6.3 Variable Importance (Random Forest)
+
+```{r var-importance, fig.cap="Variable importance measured by two metrics. MeanDecreaseGini ranks avg_glucose_level, age, and BMI as top predictors. MeanDecreaseAccuracy ranks age and ever_married highest, while avg_glucose_level shows near-zero accuracy impact — likely due to its skewed distribution in the imbalanced dataset."}
+varImpPlot(rf_model, main = "Random Forest: Variable Importance")
+```
+
+6.4 Lower Decision Threshold (0.10)
+
+In a clinical screening context, missing a true stroke case (false negative) is costlier than a false alarm (false positive). Lowering the threshold from 0.50 to 0.10 increases recall at the expense of precision — a sensible tradeoff for early-warning applications.
+
+```{r lower-threshold}
+log_pred_10 <- as.factor(ifelse(log_prob > 0.10, "1", "0"))
+rf_pred_10  <- as.factor(ifelse(rf_prob  > 0.10, "1", "0"))
+
+cat("Logistic Regression — Confusion Matrix (threshold = 0.10):\n")
+print(table(Predicted = log_pred_10, Actual = test_data$stroke))
+
+cat("\nRandom Forest — Confusion Matrix (threshold = 0.10):\n")
+print(table(Predicted = rf_pred_10, Actual = test_data$stroke))
+```
+
+At the 0.50 threshold, both models achieve high precision but very low recall. The majority of actual stroke cases are missed because the predicted probabilities rarely exceed 0.50 given the class imbalance. Lowering the threshold to 0.10 substantially increases recall: the Random Forest correctly identifies a larger proportion of true stroke cases, at the cost of flagging more non-stroke patients as high risk. In a clinical screening context this tradeoff is acceptable. A false alarm triggers follow-up testing, while a missed stroke case may go untreated. Precision at 0.10 drops but remains reportable, the confusion matrices above show exactly how many additional false positives are introduced.
+
+---
+
+7. Summary and Conclusions
+
+The baseline Logistic Regression model achieved a PR-AUC of 0.1789 compared to 0.1642 for Random Forest, and a higher AUC-ROC (0.8399 vs. 0.8101), demonstrating that the interpretable model performs comparably or better under severe class imbalance. At the standard 0.50 threshold, both models flagged only 1 true stroke case (Recall = 1.3%), illustrating how the majority class dominates prediction. Adjusting the threshold to 0.10, Logistic Regression correctly identified 45 of 75 stroke cases (Recall = 60.0%, Precision = 18.2%, F1 = 0.280), while Random Forest identified 42 of 75 (Recall = 56.0%, Precision = 16.8%, F1 = 0.258), confirming that threshold adjustment alone provides a meaningful improvement without resampling.
+Note: OOB class error for stroke = 1.0, meaning the forestnever correctly classified a stroke case out-of-bag during training.This confirms the need for threshold adjustment or resampling.
+
+---
+
+8. Appendix: Data Manipulations, Modeling Methods, and Results
+
+Appendix Overview: This appendix provides a comprehensive summary of the project's technical backend. It outlines the data cleaning process (8.1), justifies the modeling methods (8.2), evaluates base performance (8.3), presents an additional threshold analysis for the imbalanced data (8.4), and concludes with limitations and lessons learned (8.5).
+
+8.1 Data Manipulations and Preprocessing
+- Dataset: Kaggle Stroke Prediction Dataset (`stroke.csv`), 5,110 observations, 12 variables.
+- Response variable: `stroke` (binary, ~5% positive class — severe imbalance).
+- Preprocessing steps:
+  - `bmi`: Converted to numeric; applied median imputation for ~201 missing values (~4%).
+  - All categorical variables converted to factors.
+  - Stratified 70/30 train-test split implemented to preserve the severe class distribution in both sets.
+
+8.2 Modeling Methods
+- Baseline: Logistic Regression (`glm`, family = binomial) — chosen for high interpretability and alignment with clinical literature.
+- Main Model: Random Forest (`randomForest`, ntree = 500, importance = TRUE) — selected to capture non-linear interactions and better handle class imbalance without strict linear assumptions.
+- Probability cutoffs: Primary analysis evaluated at the default 0.5; an additional exploratory analysis was conducted at 0.10 to increase sensitivity for rare stroke cases.
+
+8.3 Model Performance Evaluation
+
+```{r echo=FALSE}
+print("=== Final Model Comparison Table (threshold = 0.50) ===")
+knitr::kable(metrics_table, caption = "Model Performance Comparison (threshold = 0.50)")
+```
+
+Key Observations (addressing class imbalance):
+- Random Forest outperforms Logistic Regression on PR-AUC and Recall.
+- Precision is also reported because false alarms (flagging non-stroke patients as high-risk) matter in healthcare.
+- Lowering the threshold to 0.10 significantly improves Recall (catches more true stroke cases) but reduces Precision.
+
+8.4 Threshold Sensitivity Analysis (0.10 cutoff) 
+
+At the default 0.50 threshold, both models predict "No Stroke" for virtually 
+all patients, yielding 95.18% accuracy but only 1.3% recall on stroke cases.
+
+Threshold = 0.10 results:
+
+| Model               | TP | FP  | FN | TN   | Precision | Recall | F1    |
+|---------------------|----|-----|----|------|-----------|--------|-------|
+| Logistic Regression | 45 | 202 | 30 | 1257 | 0.182     | 0.600  | 0.280 |
+| Random Forest       | 42 | 208 | 33 | 1251 | 0.168     | 0.560  | 0.258 |
+
+In a clinical screening context, the 0.10 threshold is preferred: 
+a false alarm (FP) leads to follow-up testing, whereas a missed stroke (FN) 
+may go untreated. Logistic Regression flags 60% of true stroke patients at 
+this threshold.
+
+8.5 Limitations and Lessons Learned
+
+Limitations:
+- Class imbalance (~5% positive) was not corrected during training; 
+  SMOTE or class weighting could improve minority-class recall.
+- BMI imputation with the global median may introduce bias for 
+  stroke-positive patients who tend to be older.
+- Random Forest's OOB error rate of 100% on stroke cases confirms 
+  the model learned to predict only the majority class during training.
+
+Lessons Learned:
+- Accuracy is a misleading metric for imbalanced clinical data; 
+  PR-AUC and Recall are more informative.
+- Threshold selection is a clinical decision, not a statistical one, 
+  the cost of missing a stroke vastly exceeds the cost of a false alarm.
+- An interpretable baseline (Logistic Regression) can match or outperform 
+  complex ensemble models when the data is small and highly imbalanced.
+  
+Clinical implication: In screening contexts, sensitivity (Recall) is critical because missing a true stroke case has high cost. PR-AUC and Recall are therefore prioritized over accuracy.
+
+Combined R Script: All executable code is contained in the single file Predictive Stroke Analysis Data 2(1).R.
+
